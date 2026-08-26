@@ -1,0 +1,20 @@
+{
+  "name": "elyxion-discord",
+  "version": "0.1.0",
+  "description": "A Discord bot framework for the Elyxion runtime — zero dependencies, commands, embeds, and the Discord REST + gateway APIs.",
+  "main": "index.js",
+  "keywords": [
+    "elyxion",
+    "discord",
+    "bot",
+    "framework",
+    "websocket",
+    "rest"
+  ],
+  "license": "Apache-2.0",
+  "author": "Elyxion contributors",
+  "scripts": {
+    "test": "elyxion test/framework.test.js",
+    "example": "elyxion examples/basic/bot.js"
+  }
+}
