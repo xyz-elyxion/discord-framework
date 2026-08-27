@@ -14,6 +14,8 @@ const { encodeFrame, FrameParser, intentBits } = require('../lib/gateway');
 
 const runner = new TestRunner();
 
+const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+
 // ---- util -------------------------------------------------------
 
 runner.describe('util', () => {
@@ -57,6 +59,33 @@ runner.describe('util', () => {
     assert.strictEqual(process.env.C, '3');
     delete process.env.A; delete process.env.B; delete process.env.C;
     fs.unlinkSync(file);
+  });
+});
+
+// ---- permissions -------------------------------------------------
+
+runner.describe('permissions', () => {
+  runner.it('hasPermission reads low 32-bit permission bits', () => {
+    assert.strictEqual(fw.hasPermission('8', 'ADMINISTRATOR'), true);
+    assert.strictEqual(fw.hasPermission('8192', 'MANAGE_MESSAGES'), true); // 2^13
+    assert.strictEqual(fw.hasPermission('8192', 'KICK_MEMBERS'), false);
+    assert.strictEqual(fw.hasPermission('2', 'KICK_MEMBERS'), true);
+    assert.strictEqual(fw.hasPermission('1024', 'VIEW_CHANNEL'), true);
+  });
+
+  runner.it('hasPermission reads high 32-bit permission bits (no BigInt)', () => {
+    assert.strictEqual(fw.hasPermission('1099511627776', 'MODERATE_MEMBERS'), true); // 2^40
+    assert.strictEqual(fw.hasPermission('1099511627776', 'MANAGE_MESSAGES'), false);
+  });
+
+  runner.it('ADMINISTRATOR implies every permission', () => {
+    assert.strictEqual(fw.hasPermission('8', 'KICK_MEMBERS'), true);
+    assert.strictEqual(fw.hasPermission('8', 'MODERATE_MEMBERS'), true);
+  });
+
+  runner.it('accepts arrays and comma lists of permission names', () => {
+    assert.strictEqual(fw.hasPermission(['KICK_MEMBERS', 'BAN_MEMBERS'], 'KICK_MEMBERS'), true);
+    assert.strictEqual(fw.hasPermission('KICK_MEMBERS, BAN_MEMBERS', 'BAN_MEMBERS'), true);
   });
 });
 
@@ -113,7 +142,7 @@ runner.describe('embed', () => {
 
 runner.describe('commands', () => {
   runner.it('parses prefix, name, args, and text', () => {
-    const parsed = CommandRegistry.prototype.parse || require('../lib/commands').parseCommand;
+    const parsed = require('../lib/commands').parseCommand;
     const hit = parsed('!greet ada lovelace', '!');
     assert.strictEqual(hit.name, 'greet');
     assert.deepStrictEqual(hit.args, ['ada', 'lovelace']);
@@ -136,6 +165,192 @@ runner.describe('commands', () => {
   });
 });
 
+// ---- typed args, subcommands, groups ----------------------------
+
+runner.describe('advanced commands', () => {
+  runner.it('parses typed arguments into ctx.options', async () => {
+    const bot = createBot({ token: 'test', prefix: '!' });
+    let seen = null;
+    bot.sendMessage = async () => ({});
+    bot.command('give', (ctx) => { seen = ctx; }, {
+      args: [
+        { name: 'user', type: 'user', required: true },
+        { name: 'amount', type: 'number', required: true },
+        { name: 'reason', type: 'rest' }
+      ]
+    });
+    bot._handleMessage({
+      id: '1', channel_id: 'c',
+      content: '!give <@123456789012345678> 42 thanks a lot',
+      author: { id: 'u', bot: false }
+    });
+    await tick();
+    assert(seen);
+    assert.strictEqual(seen.options.user, '123456789012345678');
+    assert.strictEqual(seen.options.amount, 42);
+    assert.strictEqual(seen.options.reason, 'thanks a lot');
+  });
+
+  runner.it('coerces booleans and integers', async () => {
+    const bot = createBot({ token: 'test', prefix: '!' });
+    let seen = null;
+    bot.sendMessage = async () => ({});
+    bot.command('cfg', (ctx) => { seen = ctx; }, {
+      args: [
+        { name: 'flag', type: 'boolean', required: true },
+        { name: 'count', type: 'integer', required: true }
+      ]
+    });
+    bot._handleMessage({ id: '1', channel_id: 'c', content: '!cfg yes 7', author: { id: 'u', bot: false } });
+    await tick();
+    assert(seen);
+    assert.strictEqual(seen.options.flag, true);
+    assert.strictEqual(seen.options.count, 7);
+  });
+
+  runner.it('emits argumentError for bad typed input', async () => {
+    const bot = createBot({ token: 'test', prefix: '!' });
+    let err = null;
+    bot.on('argumentError', (e) => { err = e; });
+    let ran = false;
+    bot.command('give', () => { ran = true; }, {
+      args: [{ name: 'amount', type: 'number', required: true }]
+    });
+    bot._handleMessage({ id: '1', channel_id: 'c', content: '!give abc', author: { id: 'u', bot: false } });
+    await tick();
+    assert(err && /number/.test(err.message));
+    assert.strictEqual(ran, false);
+  });
+
+  runner.it('reports missing required arguments', async () => {
+    const bot = createBot({ token: 'test', prefix: '!' });
+    let err = null;
+    bot.on('argumentError', (e) => { err = e; });
+    bot.command('kick', () => {}, { args: [{ name: 'user', type: 'user', required: true }] });
+    bot._handleMessage({ id: '1', channel_id: 'c', content: '!kick', author: { id: 'u', bot: false } });
+    await tick();
+    assert(err && /missing required argument "user"/.test(err.message));
+  });
+
+  runner.it('matches subcommands with space-separated names', async () => {
+    const bot = createBot({ token: 'test', prefix: '!' });
+    let which = null;
+    bot.sendMessage = async () => ({});
+    bot.command('admin', () => { which = 'root'; });
+    bot.command('admin ban', (ctx) => { which = 'ban:' + ctx.args.join(','); });
+    bot._handleMessage({ id: '1', channel_id: 'c', content: '!admin ban alice', author: { id: 'u', bot: false } });
+    await tick();
+    assert.strictEqual(which, 'ban:alice');
+  });
+
+  runner.it('prefers the longest matching subcommand path', async () => {
+    const bot = createBot({ token: 'test', prefix: '!' });
+    let which = null;
+    bot.sendMessage = async () => ({});
+    bot.command('admin', (ctx) => { which = 'root:' + ctx.text; });
+    bot.command('admin ban', (ctx) => { which = 'ban:' + ctx.text; });
+    bot.command('admin ban hard', (ctx) => { which = 'hard:' + ctx.text; });
+    bot._handleMessage({ id: '1', channel_id: 'c', content: '!admin ban hard bob', author: { id: 'u', bot: false } });
+    await tick();
+    assert.strictEqual(which, 'hard:bob');
+  });
+
+  runner.it('groups prefix command names', async () => {
+    const bot = createBot({ token: 'test', prefix: '!' });
+    let which = null;
+    bot.sendMessage = async () => ({});
+    const mod = bot.group('mod');
+    mod.command('kick', (ctx) => { which = ctx.name + ':' + ctx.args[0]; });
+    bot._handleMessage({ id: '1', channel_id: 'c', content: '!mod kick u1', author: { id: 'u', bot: false } });
+    await tick();
+    assert.strictEqual(which, 'mod kick:u1');
+  });
+});
+
+// ---- middleware, cooldowns, permissions -------------------------
+
+runner.describe('gates & middleware', () => {
+  runner.it('runs middleware in order with next()', async () => {
+    const bot = createBot({ token: 'test', prefix: '!' });
+    const log = [];
+    bot.use(async (ctx, next) => { log.push('a'); await next(); log.push('c'); });
+    bot.command('x', () => { log.push('b'); }, {
+      middleware: [(ctx, next) => { log.push('m'); return next(); }]
+    });
+    bot._handleMessage({ id: '1', channel_id: 'c', content: '!x', author: { id: 'u', bot: false } });
+    await tick();
+    assert.deepStrictEqual(log, ['a', 'm', 'b', 'c']);
+  });
+
+  runner.it('middleware can short-circuit without running the handler', async () => {
+    const bot = createBot({ token: 'test', prefix: '!' });
+    let ran = false;
+    bot.use((ctx, next) => { /* never calls next */ });
+    bot.command('x', () => { ran = true; });
+    bot._handleMessage({ id: '1', channel_id: 'c', content: '!x', author: { id: 'u', bot: false } });
+    await tick();
+    assert.strictEqual(ran, false);
+  });
+
+  runner.it('cooldown blocks repeat calls and emits an event', async () => {
+    const bot = createBot({ token: 'test', prefix: '!' });
+    let runs = 0;
+    let blocked = null;
+    bot.on('cooldown', (info) => { blocked = info; });
+    bot.command('slow', () => { runs++; }, { cooldown: 60000 });
+    const msg = { id: '1', channel_id: 'c', content: '!slow', author: { id: 'u', bot: false } };
+    bot._handleMessage(msg);
+    await tick();
+    bot._handleMessage(msg);
+    await tick();
+    assert.strictEqual(runs, 1);
+    assert(blocked && blocked.remaining > 0);
+  });
+
+  runner.it('permissions block and emit noPermission', async () => {
+    const bot = createBot({ token: 'test', prefix: '!' });
+    let ran = false;
+    let blocked = null;
+    bot.on('noPermission', (info) => { blocked = info; });
+    bot.sendMessage = async () => ({});
+    bot.command('mod', () => { ran = true; }, { permissions: ['KICK_MEMBERS'] });
+    bot._handleMessage({
+      id: '1', channel_id: 'c', guild_id: 'g', content: '!mod',
+      author: { id: 'u', bot: false },
+      member: { permissions: '1024' } // VIEW_CHANNEL only
+    });
+    await tick();
+    assert.strictEqual(ran, false);
+    assert(blocked && blocked.missing.indexOf('KICK_MEMBERS') !== -1);
+  });
+
+  runner.it('admins pass permission checks', async () => {
+    const bot = createBot({ token: 'test', prefix: '!' });
+    let ran = false;
+    bot.sendMessage = async () => ({});
+    bot.command('mod', () => { ran = true; }, { permissions: ['KICK_MEMBERS'] });
+    bot._handleMessage({
+      id: '1', channel_id: 'c', guild_id: 'g', content: '!mod',
+      author: { id: 'u', bot: false },
+      member: { permissions: '8' } // ADMINISTRATOR
+    });
+    await tick();
+    assert.strictEqual(ran, true);
+  });
+
+  runner.it('guildOnly denies commands in DMs', async () => {
+    const bot = createBot({ token: 'test', prefix: '!' });
+    let ran = false;
+    let denied = null;
+    bot.on('commandDenied', (info) => { denied = info; });
+    bot.command('guild', () => { ran = true; }, { guildOnly: true });
+    bot._handleMessage({ id: '1', channel_id: 'c', content: '!guild', author: { id: 'u', bot: false } });
+    await tick();
+    assert.strictEqual(ran, false);
+    assert(denied && denied.reason === 'guildOnly');
+  });
+});
+
 // ---- bot dispatch -----------------------------------------------
 
 runner.describe('bot', () => {
@@ -152,7 +367,7 @@ runner.describe('bot', () => {
       content: '!ping',
       author: { id: 'u1', bot: false }
     });
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await tick();
 
     assert(sent, 'expected a reply');
     assert.strictEqual(sent.channelId, 'c1');
@@ -167,7 +382,7 @@ runner.describe('bot', () => {
     bot.command('echo', (ctx) => { seen = ctx; ctx.reply(ctx.text); });
 
     bot._handleMessage({ id: 'x', channel_id: 'c', content: '.echo hello world', author: { id: 'u', bot: false } });
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await tick();
 
     assert.strictEqual(seen.name, 'echo');
     assert.deepStrictEqual(seen.args, ['hello', 'world']);
@@ -181,7 +396,7 @@ runner.describe('bot', () => {
 
     bot._handleMessage({ id: '1', channel_id: 'c', content: '!ping', author: { id: 'bot1', bot: true } });
     bot._handleMessage({ id: '2', channel_id: 'c', content: '!nope', author: { id: 'u', bot: false } });
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await tick();
 
     assert.strictEqual(ran, false);
   });
@@ -193,17 +408,340 @@ runner.describe('bot', () => {
     bot.command('boom', () => { throw new Error('kaboom'); });
 
     bot._handleMessage({ id: '1', channel_id: 'c', content: '!boom', author: { id: 'u', bot: false } });
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await tick();
 
     assert(error && error.message === 'kaboom');
   });
 
-  runner.it('dispatches gateway dispatch events', () => {
+  runner.it('dispatches gateway dispatch events and feeds the cache', () => {
     const bot = createBot({ token: 'test', prefix: '!' });
     let got = null;
     bot.on('MESSAGE_CREATE', (m) => { got = m; });
-    bot._handleGatewayEvent({ op: 0, t: 'MESSAGE_CREATE', d: { id: '1' } });
+    bot._handleGatewayEvent({ op: 0, t: 'MESSAGE_CREATE', d: { id: '1', channel_id: 'c1', content: 'hi' } });
     assert.strictEqual(got.id, '1');
+    assert(bot.cache.getMessage('c1', '1'));
+  });
+});
+
+// ---- interactions ------------------------------------------------
+
+runner.describe('interactions', () => {
+  runner.it('extracts slash command options including subcommand paths', () => {
+    const data = {
+      name: 'admin',
+      options: [
+        { name: 'ban', type: 1, options: [
+          { name: 'user', type: 6, value: '123456789012345678' },
+          { name: 'reason', type: 3, value: 'spam' }
+        ] }
+      ]
+    };
+    const opts = fw.extractOptions(data);
+    assert.strictEqual(opts.map.user, '123456789012345678');
+    assert.strictEqual(opts.map.reason, 'spam');
+    assert.strictEqual(opts.raw.length, 2);
+    assert.strictEqual(fw.interactionPath(data), 'admin ban');
+  });
+
+  runner.it('dispatches an APPLICATION_COMMAND interaction with a reply', async () => {
+    const bot = createBot({ token: 'test', prefix: '!' });
+    let called = null;
+    const posts = [];
+    bot.rest.post = async (path, body) => { posts.push({ path, body }); return { statusCode: 200, data: {} }; };
+    bot.slash('ping', (ctx) => { called = ctx; ctx.reply('pong'); }, { description: 'Ping' });
+
+    bot.interactions.handle({
+      type: 2, id: 'i1', token: 'tok', application_id: 'app', channel_id: 'c',
+      data: { name: 'ping', options: [] }
+    }, bot);
+    await tick();
+
+    assert(called);
+    assert.strictEqual(posts.length, 1);
+    assert.strictEqual(posts[0].path, '/interactions/i1/tok/callback');
+    assert.strictEqual(posts[0].body.type, 4);
+    assert.strictEqual(posts[0].body.data.content, 'pong');
+  });
+
+  runner.it('routes component interactions by custom id', async () => {
+    const bot = createBot({ token: 'test', prefix: '!' });
+    let which = null;
+    bot.rest.post = async () => ({ statusCode: 200, data: {} });
+    bot.button('like', (ctx) => { which = ctx.customId; ctx.update({ content: 'Liked!' }); });
+
+    bot.interactions.handle({
+      type: 3, id: 'i2', token: 'tok2', application_id: 'app',
+      data: { custom_id: 'like', component_type: 2 }
+    }, bot);
+    await tick();
+
+    assert.strictEqual(which, 'like');
+  });
+
+  runner.it('routes modal submissions by custom id', async () => {
+    const bot = createBot({ token: 'test', prefix: '!' });
+    let which = null;
+    bot.rest.post = async () => ({ statusCode: 200, data: {} });
+    bot.modal('feedback', (ctx) => { which = ctx.customId; ctx.reply('Thanks!'); });
+
+    bot.interactions.handle({
+      type: 5, id: 'i3', token: 'tok3', application_id: 'app',
+      data: { custom_id: 'feedback', components: [] }
+    }, bot);
+    await tick();
+
+    assert.strictEqual(which, 'feedback');
+  });
+
+  runner.it('deferred interactions route replies through the webhook', async () => {
+    const bot = createBot({ token: 'test', prefix: '!' });
+    const posts = [];
+    bot.rest.post = async (path, body) => { posts.push({ path, body }); return { statusCode: 200, data: {} }; };
+    bot.slash('slow', async (ctx) => {
+      await ctx.defer(true);
+      ctx.reply('done');
+    });
+
+    bot.interactions.handle({
+      type: 2, id: 'i4', token: 'tok4', application_id: 'app', channel_id: 'c',
+      data: { name: 'slow', options: [] }
+    }, bot);
+    await tick();
+
+    assert.strictEqual(posts.length, 2);
+    assert.strictEqual(posts[0].body.type, 5); // deferred
+    assert.strictEqual(posts[0].body.data.flags, 64); // ephemeral
+    assert.strictEqual(posts[1].path, '/webhooks/app/tok4'); // followup
+    assert.strictEqual(posts[1].body.content, 'done');
+  });
+
+  runner.it('builds slash command API bodies including subcommands', async () => {
+    const bot = createBot({ token: 'test', prefix: '!' });
+    bot.slash('admin', () => {}, {
+      description: 'Admin commands',
+      subcommands: {
+        ban: {
+          description: 'Ban a user',
+          options: [{ name: 'user', type: 'user', required: true, description: 'Who' }]
+        },
+        kick: { description: 'Kick a user' }
+      }
+    });
+    const puts = [];
+    await bot.interactions.registerAll(
+      { put: async (p, b) => { puts.push({ p, b }); return { statusCode: 200 }; } },
+      'app1'
+    );
+    assert.strictEqual(puts.length, 1);
+    assert.strictEqual(puts[0].p, '/applications/app1/commands');
+    assert.strictEqual(puts[0].b.length, 1); // subcommands aren't separate commands
+    assert.strictEqual(puts[0].b[0].name, 'admin');
+    assert.strictEqual(puts[0].b[0].options.length, 2);
+    assert.strictEqual(puts[0].b[0].options[0].type, 1); // SUB_COMMAND
+    assert.strictEqual(puts[0].b[0].options[0].name, 'ban');
+    assert.strictEqual(puts[0].b[0].options[0].options[0].type, 6); // USER
+  });
+
+  runner.it('sends a modal payload with builder components', () => {
+    const modal = new fw.Modal()
+      .setCustomId('feedback')
+      .setTitle('Feedback')
+      .addComponent(new fw.ActionRow().addComponent(
+        new fw.TextInput().setCustomId('body').setLabel('Message').setStyle(2).setRequired(true)
+      ));
+    const json = modal.toJSON();
+    assert.strictEqual(json.custom_id, 'feedback');
+    assert.strictEqual(json.title, 'Feedback');
+    assert.strictEqual(json.components[0].type, 1);
+    assert.strictEqual(json.components[0].components[0].type, 4);
+    assert.strictEqual(json.components[0].components[0].custom_id, 'body');
+    assert.strictEqual(json.components[0].components[0].required, true);
+  });
+
+  runner.it('button and select builders validate their payloads', () => {
+    const button = new fw.Button().setStyle(5).setURL('https://example.com').setLabel('Visit');
+    assert.strictEqual(button.toJSON().style, 5);
+    assert.throws(() => new fw.Button().toJSON(), /custom_id/);
+
+    const select = new fw.SelectMenu()
+      .setCustomId('pick')
+      .addOption({ label: 'A', value: 'a' })
+      .addOption({ label: 'B', value: 'b' });
+    assert.strictEqual(select.toJSON().options.length, 2);
+  });
+});
+
+// ---- cache ------------------------------------------------------
+
+runner.describe('cache', () => {
+  runner.it('stores and evicts messages per channel', () => {
+    const cache = new fw.Cache({ messageLimitPerChannel: 2 });
+    cache.handle('MESSAGE_CREATE', { id: 'm1', channel_id: 'c1', content: 'a' });
+    cache.handle('MESSAGE_CREATE', { id: 'm2', channel_id: 'c1', content: 'b' });
+    cache.handle('MESSAGE_CREATE', { id: 'm3', channel_id: 'c1', content: 'c' });
+    assert.strictEqual(cache.getMessage('c1', 'm1'), null);
+    assert(cache.getMessage('c1', 'm2'));
+    assert(cache.getMessage('c1', 'm3'));
+  });
+
+  runner.it('removes messages on MESSAGE_DELETE', () => {
+    const cache = new fw.Cache();
+    cache.handle('MESSAGE_CREATE', { id: 'm1', channel_id: 'c1' });
+    cache.handle('MESSAGE_DELETE', { id: 'm1', channel_id: 'c1' });
+    assert.strictEqual(cache.getMessage('c1', 'm1'), null);
+  });
+
+  runner.it('seeds channels and roles from GUILD_CREATE and cleans up on delete', () => {
+    const cache = new fw.Cache();
+    cache.handle('GUILD_CREATE', {
+      id: 'g1',
+      name: 'Test',
+      channels: [{ id: 'c1', guild_id: 'g1' }],
+      roles: [{ id: 'r1', guild_id: 'g1' }],
+      members: [{ guild_id: 'g1', user: { id: 'u1' } }]
+    });
+    assert.strictEqual(cache.getGuild('g1').name, 'Test');
+    assert(cache.getChannel('c1'));
+    assert(cache.getRole('g1', 'r1'));
+    assert(cache.getMember('g1', 'u1'));
+    cache.handle('GUILD_DELETE', { id: 'g1' });
+    assert.strictEqual(cache.getGuild('g1'), null);
+    assert.strictEqual(cache.getChannel('c1'), null);
+    assert.strictEqual(cache.getRole('g1', 'r1'), null);
+    assert.strictEqual(cache.getMember('g1', 'u1'), null);
+  });
+
+  runner.it('respects disabled collections', () => {
+    const cache = new fw.Cache({ users: false });
+    cache.handle('USER_UPDATE', { id: 'u1', username: 'x' });
+    assert.strictEqual(cache.getUser('u1'), null);
+    cache.handle('MESSAGE_CREATE', { id: 'm1', channel_id: 'c1' });
+    assert(cache.getMessage('c1', 'm1'));
+  });
+});
+
+// ---- REST helpers ------------------------------------------------
+
+runner.describe('rest helpers', () => {
+  runner.it('routeKey normalizes snowflakes', () => {
+    const { routeKey } = require('../lib/rest');
+    const a = routeKey('GET', '/channels/123456789012345678/messages');
+    const b = routeKey('GET', '/channels/999999999999999999/messages');
+    assert.strictEqual(a, b);
+    assert(a.indexOf('{id}') !== -1);
+  });
+
+  runner.it('parseHeaders reads a rate-limit header block', () => {
+    const { parseHeaders } = require('../lib/rest');
+    const headers = parseHeaders(
+      'HTTP/1.1 200 OK\r\n' +
+      'X-RateLimit-Limit: 5\r\n' +
+      'X-RateLimit-Remaining: 0\r\n' +
+      'X-RateLimit-Reset-After: 2.5\r\n' +
+      'X-RateLimit-Bucket: abc\r\n' +
+      'Content-Type: application/json\r\n'
+    );
+    assert.strictEqual(headers['x-ratelimit-limit'], '5');
+    assert.strictEqual(headers['x-ratelimit-remaining'], '0');
+    assert.strictEqual(headers['x-ratelimit-reset-after'], '2.5');
+    assert.strictEqual(headers['x-ratelimit-bucket'], 'abc');
+  });
+
+  runner.it('sleepSync blocks for the requested time', () => {
+    const { sleepSync } = require('../lib/rest');
+    const start = Date.now();
+    sleepSync(20);
+    assert(Date.now() - start >= 10);
+  });
+
+  runner.it('sendFile throws without a file payload', () => {
+    const { RestClient } = fw;
+    const rest = new RestClient({ token: 'test' });
+    assert.throws(() => rest.sendFile('c1', { content: 'hi' }), /file/);
+  });
+});
+
+// ---- gateway session & presence ---------------------------------
+
+runner.describe('gateway session', () => {
+  // Feed a parsed JSON payload straight into the frame handler and
+  // capture outbound frames via a stubbed _write.
+  function makeGateway(capture, options) {
+    const gw = new fw.Gateway(Object.assign({ token: 'tok', intents: ['GUILDS'] }, options || {}));
+    gw._write = (buf) => {
+      const frames = new FrameParser().push(buf);
+      for (const f of frames) capture.push(JSON.parse(String(f.payload)));
+    };
+    return gw;
+  }
+
+  function payload(obj) {
+    return { opcode: 1, payload: Buffer.from(JSON.stringify(obj)) };
+  }
+
+  runner.it('identifies on Hello and stores the session on READY', () => {
+    const sent = [];
+    const gw = makeGateway(sent);
+    let readyData = null;
+    gw.on('ready', (d) => { readyData = d; });
+
+    gw._onFrame(payload({ op: 10, d: { heartbeat_interval: 41250 } }));
+    assert.strictEqual(sent[0].op, 2); // identify
+    assert.strictEqual(sent[0].d.intents, 1);
+
+    gw._onFrame(payload({ op: 0, t: 'READY', s: 3, d: { session_id: 'sess1', user: { id: 'u1' } } }));
+    assert.strictEqual(gw.session_id, 'sess1');
+    assert(readyData && readyData.session_id === 'sess1');
+    assert.strictEqual(gw._sequence, 3);
+    gw.close();
+  });
+
+  runner.it('resumes with op 6 on a reconnect', () => {
+    const sent = [];
+    const gw = makeGateway(sent);
+    gw._onFrame(payload({ op: 10, d: { heartbeat_interval: 41250 } }));
+    gw._onFrame(payload({ op: 0, t: 'READY', s: 5, d: { session_id: 'sess2', user: { id: 'u1' } } }));
+    gw._resumeRequested = true;
+    gw._onFrame(payload({ op: 10, d: { heartbeat_interval: 41250 } }));
+    const resume = sent[sent.length - 1];
+    assert.strictEqual(resume.op, 6);
+    assert.strictEqual(resume.d.session_id, 'sess2');
+    assert.strictEqual(resume.d.seq, 5);
+    gw.close();
+  });
+
+  runner.it('drops the session and re-identifies on op 9 with false', () => {
+    const sent = [];
+    const gw = makeGateway(sent);
+    gw._onFrame(payload({ op: 10, d: { heartbeat_interval: 41250 } }));
+    gw._onFrame(payload({ op: 0, t: 'READY', s: 9, d: { session_id: 'sess3', user: { id: 'u1' } } }));
+    gw._resumeRequested = true;
+    gw._onFrame(payload({ op: 9, d: false }));
+    assert.strictEqual(gw.session_id, null);
+    assert.strictEqual(gw._sequence, null);
+    gw.close();
+  });
+
+  runner.it('sends presence updates as op 3', () => {
+    const sent = [];
+    const gw = makeGateway(sent);
+    gw._connected = true;
+    gw.setPresence({ status: 'dnd', activities: [{ name: 'Coding', type: 0 }] });
+    assert.strictEqual(sent[0].op, 3);
+    assert.strictEqual(sent[0].d.status, 'dnd');
+    assert.strictEqual(sent[0].d.activities[0].name, 'Coding');
+    gw.close();
+  });
+
+  runner.it('answers heartbeat requests with the current sequence', () => {
+    const sent = [];
+    const gw = makeGateway(sent);
+    gw._connected = true;
+    gw._sequence = 42;
+    gw._onFrame(payload({ op: 1 }));
+    assert.strictEqual(sent[0].op, 1);
+    assert.strictEqual(sent[0].d, 42);
+    gw.close();
   });
 });
 

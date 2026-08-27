@@ -6,6 +6,7 @@
 //
 //   const bot = createBot({ prefix: '!', token: process.env.DISCORD_TOKEN });
 //   bot.command('ping', (ctx) => ctx.reply('pong'));
+//   bot.slash('ping', (ctx) => ctx.reply('pong'), { description: 'Ping' });
 //   bot.on('ready', (user) => console.log('Logged in as ' + user.username));
 //   bot.login().then(() => bot.connect());
 //
@@ -16,16 +17,31 @@
 'use strict';
 
 const { Bot, createBot } = require('./lib/client');
-const { CommandRegistry } = require('./lib/commands');
-const { RestClient } = require('./lib/rest');
+const { CommandRegistry, CommandGroup, parseCommand, parseArgs, ARG_TYPES } = require('./lib/commands');
+const { RestClient, DEFAULT_BASE_URL, routeKey, parseHeaders, sleepSync } = require('./lib/rest');
 const { Gateway, FrameParser, encodeFrame } = require('./lib/gateway');
 const { Embed } = require('./lib/embed');
+const { Cache } = require('./lib/cache');
+const {
+  InteractionRegistry,
+  InteractionContext,
+  ActionRow,
+  Button,
+  SelectMenu,
+  TextInput,
+  Modal,
+  InteractionTypes,
+  OptionTypes,
+  extractOptions,
+  interactionPath,
+  normalizeMessage
+} = require('./lib/interactions');
 const {
   resolveColor, parseMention, snowflakeToDate, isSnowflake,
-  truncate, loadEnv
+  truncate, loadEnv, PERMISSIONS, hasPermission, hasBit, decimalToWords
 } = require('./lib/util');
 
-const VERSION = '0.1.0';
+const VERSION = '0.2.0';
 
 module.exports = {
   version: VERSION,
@@ -34,9 +50,19 @@ module.exports = {
   Bot,
   createBot,
 
-  // Commands & REST
+  // Commands
   CommandRegistry,
+  CommandGroup,
+  parseCommand,
+  parseArgs,
+  ARG_TYPES,
+
+  // REST
   RestClient,
+  DEFAULT_BASE_URL,
+  routeKey,
+  parseHeaders,
+  sleepSync,
 
   // Gateway (WebSocket)
   Gateway,
@@ -46,7 +72,28 @@ module.exports = {
   // Embeds
   Embed,
 
-  // Utilities
+  // Cache
+  Cache,
+
+  // Interactions
+  InteractionRegistry,
+  InteractionContext,
+  ActionRow,
+  Button,
+  SelectMenu,
+  TextInput,
+  Modal,
+  InteractionTypes,
+  OptionTypes,
+  extractOptions,
+  interactionPath,
+  normalizeMessage,
+
+  // Permissions & utilities
+  PERMISSIONS,
+  hasPermission,
+  hasBit,
+  decimalToWords,
   resolveColor,
   parseMention,
   snowflakeToDate,

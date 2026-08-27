@@ -5,7 +5,7 @@
 const fs = require('fs');
 const path = require('path');
 
-const VERSION = '0.1.0';
+const VERSION = '0.2.0';
 
 const HELP = [
   '',
@@ -136,8 +136,7 @@ const EXAMPLE_BOT = [
   '',
   "const { loadEnv } = require('elyxion-discord');",
   'loadEnv(); // read .env if present (no dependencies)',
-  '',
-  "const { createBot, Embed } = require('elyxion-discord');",
+  '',  "  const { createBot, Embed } = require('elyxion-discord');",
   '',
   'const bot = createBot({',
   "  prefix: process.env.PREFIX || '!',",
@@ -158,9 +157,12 @@ const EXAMPLE_BOT = [
   '  ctx.reply({ embeds: [embed.toJSON()] });',
   "}, { description: 'Sends an embed' });",
   '',
+  '// Slash commands are auto-registered with Discord after login.',
+  "bot.slash('ping', (ctx) => ctx.reply('pong!'), { description: 'Replies with pong' });",
+  '',
   "bot.on('ready', (user) => {",
   "  console.log('  ⚡ Logged in as ' + user.username + ' (' + user.id + ')');",
-  "  console.log('     Commands: !ping, !embed');",
+  "  console.log('     Commands: !ping, !embed, /ping');",
   "  console.log('');",
   '});',
   '',
