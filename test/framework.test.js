@@ -791,6 +791,324 @@ runner.describe('gateway framing', () => {
   });
 });
 
+// ---- v0.3: full API surface -------------------------------------
+
+runner.describe('v0.3 util & collection', () => {
+  runner.it('permissionsToBitfield combines names into a decimal bitfield', () => {
+    const bits = fw.permissionsToBitfield(['SEND_MESSAGES', 'KICK_MEMBERS']);
+    assert.strictEqual(bits, String((1 << 11) | (1 << 1)));
+    assert.strictEqual(fw.hasPermission(bits, 'KICK_MEMBERS'), true);
+    assert.strictEqual(fw.hasPermission(bits, 'MANAGE_MESSAGES'), false);
+  });
+
+  runner.it('permissionsToBitfield handles high bits without BigInt', () => {
+    const bits = fw.permissionsToBitfield(['MODERATE_MEMBERS']); // bit 40
+    assert.strictEqual(bits, '1099511627776');
+    assert.strictEqual(fw.hasPermission(bits, 'MODERATE_MEMBERS'), true);
+  });
+
+  runner.it('permissionsToBitfield accepts numbers, strings, and comma lists', () => {
+    assert.strictEqual(fw.permissionsToBitfield(8), '8');
+    assert.strictEqual(fw.permissionsToBitfield('8192'), '8192');
+    assert.strictEqual(fw.hasPermission(
+      fw.permissionsToBitfield('KICK_MEMBERS, BAN_MEMBERS'), 'BAN_MEMBERS'), true);
+    assert.throws(() => fw.permissionsToBitfield(['NOT_A_PERM']), /Unknown permission/);
+  });
+
+  runner.it('buildQuery encodes params and skips empties', () => {
+    assert.strictEqual(fw.buildQuery({ limit: 50, before: '123', after: undefined }),
+      '?limit=50&before=123');
+    assert.strictEqual(fw.buildQuery({}), '');
+    assert.strictEqual(fw.buildQuery(null), '');
+  });
+
+  runner.it('encodeEmoji handles unicode and custom forms', () => {
+    assert.strictEqual(fw.encodeEmoji('<:smile:123456789012345678>'),
+      'smile:123456789012345678');
+    assert.strictEqual(fw.encodeEmoji('<a:dance:999999999999999999>'),
+      'dance:999999999999999999');
+    assert.ok(fw.encodeEmoji('\uD83D\uDC4D').indexOf('%') !== -1);
+  });
+
+  runner.it('Collection provides find/filter/map/sort/random/sweep', () => {
+    const c = new fw.Collection([['a', 3], ['b', 1], ['c', 2]]);
+    assert.strictEqual(c.find((v) => v === 2), 2);
+    assert.strictEqual(c.filter((v) => v > 1).size, 2);
+    assert.deepStrictEqual(c.map((v) => v * 10), [30, 10, 20]);
+    c.sortInPlace((x, y) => x - y);
+    assert.deepStrictEqual(c.toArray(), [1, 2, 3]);
+    assert.strictEqual(c.first, 1);
+    assert.strictEqual(c.last, 3);
+    assert.ok(typeof c.random() === 'number'); // single random pick
+    assert.strictEqual(c.sweep((v) => v >= 2), 2);
+    assert.strictEqual(c.size, 1);
+  });
+});
+
+runner.describe('v0.3 API payloads', () => {
+  runner.it('bulkDeleteBody validates and dedupes ids', () => {
+    const { bulkDeleteBody } = require('../lib/api');
+    assert.deepStrictEqual(bulkDeleteBody(['m2', 'm1', 'm2']).messages, ['m2', 'm1']);
+    assert.throws(() => bulkDeleteBody(['only-one']), /between 2 and 100/);
+    assert.throws(() => bulkDeleteBody(new Array(101).fill('x')), /between 2 and 100/);
+  });
+
+  runner.it('buildOverwrites converts permission names to bitfields', () => {
+    const { buildOverwrites } = require('../lib/api');
+    const out = buildOverwrites([{
+      id: '555', type: 'member',
+      allow: ['VIEW_CHANNEL'],
+      deny: ['SEND_MESSAGES', 'ADD_REACTIONS']
+    }]);
+    assert.strictEqual(out[0].type, 1);
+    assert.strictEqual(out[0].allow, String(1 << 10));
+    assert.strictEqual(out[0].deny, String((1 << 11) | (1 << 6)));
+  });
+
+  runner.it('REST endpoints land on the right URLs', async () => {
+    const bot = createBot({ token: 'test', prefix: '!' });
+    const calls = [];
+    const METHOD_NAMES = { get: 'GET', post: 'POST', put: 'PUT', patch: 'PATCH', del: 'DELETE' };
+    for (const m of ['get', 'post', 'put', 'patch', 'del']) {
+      bot.rest[m] = async (path, body) => {
+        calls.push(METHOD_NAMES[m] + ' ' + path);
+        return { statusCode: 200, data: {} };
+      };
+    }
+
+    await bot.kick('g1', 'u1');
+    await bot.unban('g1', 'u2');
+    await bot.setNickname('g1', 'u3', 'Nick');
+    await bot.timeout('g1', 'u4', 60000);
+    await bot.addRole('g1', 'u5', 'r1');
+    await bot.triggerTyping('c1');
+    await bot.bulkDelete('c1', ['m1', 'm2']);
+    await bot.createInvite('c1', { maxAgeSeconds: 3600, maxUses: 10 });
+    await bot.clearReactions('c1', 'm9');
+
+    assert(calls.indexOf('DELETE /guilds/g1/members/u1') !== -1);
+    assert(calls.indexOf('DELETE /guilds/g1/bans/u2') !== -1);
+    assert(calls.indexOf('PATCH /guilds/g1/members/u3') !== -1);
+    let timeoutCall = null;
+    for (const c of calls) if (c.indexOf('/members/u4') !== -1 && c.indexOf('PATCH') === 0) timeoutCall = c;
+    assert(timeoutCall, 'expected a PATCH timeout call');
+    assert(calls.indexOf('PUT /guilds/g1/members/u5/roles/r1') !== -1);
+    assert(calls.indexOf('POST /channels/c1/typing') !== -1);
+    assert(calls.indexOf('POST /channels/c1/messages/bulk-delete') !== -1);
+    assert(calls.indexOf('POST /channels/c1/invites') !== -1);
+    assert(calls.indexOf('DELETE /channels/c1/messages/m9/reactions') !== -1);
+  });
+
+  runner.it('_expect turns HTTP errors into thrown Errors with codes', async () => {
+    const bot = createBot({ token: 'test', prefix: '!' });
+    bot.rest.del = async () => ({ statusCode: 403, data: { message: 'Missing Permissions' } });
+    let err = null;
+    try { await bot.kick('g1', 'u1'); } catch (e) { err = e; }
+    assert(err && err.message.indexOf('kick failed (HTTP 403)') === 0);
+    assert.strictEqual(err.statusCode, 403);
+  });
+});
+
+runner.describe('v0.3 messaging conveniences', () => {
+  runner.it('react encodes emoji into the PUT endpoint', async () => {
+    const bot = createBot({ token: 'test', prefix: '!' });
+    let path = null;
+    bot.rest.put = async (p) => { path = p; return { statusCode: 204, data: null }; };
+    await bot.react('c1', 'm1', '\uD83D\uDC4D');
+    assert(path.indexOf('/reactions/') !== -1 && path.endsWith('/@me'));
+    await bot.react('c1', 'm1', '<:smile:123456789012345678>');
+    assert(path.indexOf('/reactions/smile:123456789012345678/@me') !== -1);
+  });
+
+  runner.it('sendDM opens a DM channel then posts to it', async () => {
+    const bot = createBot({ token: 'test', prefix: '!' });
+    const calls = [];
+    bot.rest.post = async (path, body) => {
+      calls.push({ path, body });
+      return path === '/users/@me/channels'
+        ? { statusCode: 200, data: { id: 'dm1' } }
+        : { statusCode: 200, data: {} };
+    };
+    await bot.sendDM('u1', 'hello there');
+    assert.strictEqual(calls[0].path, '/users/@me/channels');
+    assert.strictEqual(calls[1].path, '/channels/dm1/messages');
+    assert.strictEqual(calls[1].body.content, 'hello there');
+  });
+
+  runner.it('defaultAllowedMentions merge into outgoing messages', async () => {
+    const bot = createBot({
+      token: 'test', prefix: '!',
+      defaultAllowedMentions: { parse: ['users'] }
+    });
+    let sent = null;
+    bot.rest.post = async (path, body) => { sent = body; return { statusCode: 200, data: {} }; };
+
+    await bot.sendMessage('c1', 'hi');
+    assert.deepStrictEqual(sent.allowed_mentions, { parse: ['users'] });
+
+    await bot.sendMessage('c1', { content: 'hi', allowed_mentions: { parse: [] } });
+    assert.deepStrictEqual(sent.allowed_mentions, { parse: [] }); // caller wins
+  });
+
+  runner.it('fetchMessages pages and warms the cache', async () => {
+    const bot = createBot({ token: 'test', prefix: '!' });
+    bot.rest.get = async () => ({
+      statusCode: 200,
+      data: [{ id: 'm1', content: 'one' }, { id: 'm2', content: 'two' }]
+    });
+    const page = await bot.fetchMessages('c1');
+    assert.strictEqual(page.size, 2);
+    assert.strictEqual(bot.cache.getMessage('c1', 'm1').content, 'one');
+  });
+});
+
+runner.describe('v0.3 derived events', () => {
+  runner.it('messageUpdate carries old and new states', async () => {
+    const bot = createBot({ token: 'test', prefix: '!' });
+    bot.cache.handle('MESSAGE_CREATE', { id: 'm1', channel_id: 'c1', content: 'before' });
+    let update = null;
+    bot.on('messageUpdate', (u) => { update = u; });
+    bot._handleGatewayEvent({ op: 0, t: 'MESSAGE_UPDATE', d: { id: 'm1', channel_id: 'c1', content: 'after' } });
+    await tick();
+    assert(update && update.old && update.old.content === 'before');
+    assert(update.new.content === 'after');
+  });
+
+  runner.it('messageDelete exposes the deleted content, bulk included', async () => {
+    const bot = createBot({ token: 'test', prefix: '!' });
+    bot.cache.handle('MESSAGE_CREATE', { id: 'm1', channel_id: 'c1', content: 'gone soon' });
+    let del = null;
+    bot.on('messageDelete', (d) => { del = d; });
+    bot._handleGatewayEvent({ op: 0, t: 'MESSAGE_DELETE', d: { id: 'm1', channel_id: 'c1' } });
+    await tick();
+    assert(del && del.old && del.old.content === 'gone soon');
+
+    let bulkDel = null;
+    bot.on('messageDelete', (d) => { bulkDel = d; });
+    bot._handleGatewayEvent({ op: 0, t: 'MESSAGE_DELETE_BULK', d: { ids: ['a', 'b'], channel_id: 'c1' } });
+    await tick();
+    assert(bulkDel && bulkDel.bulk === true);
+  });
+
+  runner.it('reactionAdd resolves the reacting user', async () => {
+    const bot = createBot({ token: 'test', prefix: '!' });
+    let reaction = null;
+    bot.on('reactionAdd', (r) => { reaction = r; });
+    bot._handleGatewayEvent({
+      op: 0, t: 'MESSAGE_REACTION_ADD',
+      d: {
+        user_id: 'u1', message_id: 'm1', channel_id: 'c1', burst: false,
+        member: { user: { id: 'u1', username: 'ada' } },
+        emoji: { id: null, name: '\uD83D\uDC4D' }
+      }
+    });
+    await tick();
+    assert(reaction && reaction.userId === 'u1');
+    assert(reaction.user.username === 'ada');
+    assert(reaction.emoji.name === '\uD83D\uDC4D');
+  });
+
+  runner.it('guildMemberAdd delivers cached members with guild attached', async () => {
+    const bot = createBot({ token: 'test', prefix: '!' });
+    bot.cache.handle('GUILD_CREATE', { id: 'g1', name: 'Test Guild' });
+    bot.cache.handle('GUILD_MEMBER_ADD', { guild_id: 'g1', user: { id: 'u5' } });
+    let added = null;
+    bot.on('guildMemberAdd', (m) => { added = m; });
+    bot._handleGatewayEvent({ op: 0, t: 'GUILD_MEMBER_ADD', d: { guild_id: 'g1', user: { id: 'u5' } } });
+    await tick();
+    assert(added && added.user.id === 'u5');
+    assert(added.guild && added.guild.name === 'Test Guild');
+  });
+
+  runner.it('voiceStateUpdate reports joins, moves, and leaves', async () => {
+    const bot = createBot({ token: 'test', prefix: '!' });
+    const updates = [];
+    bot.on('voiceStateUpdate', (u) => updates.push(u));
+    bot._handleGatewayEvent({
+      op: 0, t: 'VOICE_STATE_UPDATE',
+      d: { user_id: 'u1', session_id: 's1', channel_id: 'vc1', guild_id: 'g1' }
+    });
+    await tick();
+    assert(updates[0] && updates[0].joined === true);
+
+    bot._handleGatewayEvent({
+      op: 0, t: 'VOICE_STATE_UPDATE',
+      d: { user_id: 'u1', session_id: 's1', channel_id: 'vc2', guild_id: 'g1' }
+    });
+    await tick();
+    assert(updates[1] && updates[1].movedChannel === true && updates[1].old.channel_id === 'vc1');
+
+    bot._handleGatewayEvent({
+      op: 0, t: 'VOICE_STATE_UPDATE',
+      d: { user_id: 'u1', session_id: 's1', channel_id: null, guild_id: 'g1' }
+    });
+    await tick();
+    assert(updates[2] && updates[2].left === true);
+  });
+});
+
+runner.describe('v0.3 voice & chunks', () => {
+  runner.it('discovery packets round-trip through the parser', () => {
+    const { encodeDiscoveryPacket, parseDiscoveryPacket } = require('../lib/voice');
+    const packet = encodeDiscoveryPacket(1234567890);
+    assert.strictEqual(packet.length, 74);
+    assert.strictEqual(packet.readUInt32LE(4), 1234567890);
+
+    const reply = Buffer.alloc(74);
+    reply.writeUInt16LE(0x2, 0); // response type
+    reply.writeUInt16LE(70, 2);
+    reply.writeUInt32LE(1234567890, 4);
+    reply.write('192.168.1.25', 8, 'ascii');
+    reply.writeUInt16LE(50000, 72);
+    const parsed = parseDiscoveryPacket(reply);
+    assert.strictEqual(parsed.ip, '192.168.1.25');
+    assert.strictEqual(parsed.port, 50000);
+  });
+
+  runner.it('VoiceManager issues an op-4 join over the client gateway', async () => {
+    const bot = createBot({ token: 'test', prefix: '!' });
+    bot.user = { id: 'bot1' };
+    let sentState = null;
+    bot.gateway = { sendVoiceState(s) { sentState = s; } };
+    bot.voice.join('g1', 'vc1', { selfDeaf: true });
+    assert(sentState && sentState.guild_id === 'g1' && sentState.channel_id === 'vc1');
+    assert.strictEqual(sentState.self_deaf, true);
+  });
+
+  runner.it('requestGuildMembers sends op 8 with sane defaults', () => {
+    const sent = [];
+    const gw = new fw.Gateway({ token: 'tok', intents: ['GUILD_MEMBERS'] });
+    gw._connected = true;
+    gw._write = (buf) => {
+      for (const f of new FrameParser().push(buf)) sent.push(JSON.parse(String(f.payload)));
+    };
+    gw.requestGuildMembers({ guild_id: 'g1' });
+    assert.strictEqual(sent[0].op, 8);
+    assert.strictEqual(sent[0].d.guild_id, 'g1');
+    assert.strictEqual(sent[0].d.query, '');
+    gw.requestGuildMembers({ guild_id: 'g1', user_ids: [42, '99'] });
+    assert.deepStrictEqual(sent[1].d.user_ids, ['42', '99']);
+    assert.strictEqual(sent[1].d.query, undefined);
+    assert.throws(() => gw.requestGuildMembers({}), /guild_id/);
+    gw.close();
+  });
+
+  runner.it('cache ingests GUILD_MEMBERS_CHUNK and thread events', () => {
+    const cache = new fw.Cache();
+    cache.handle('GUILD_MEMBERS_CHUNK', {
+      guild_id: 'g1',
+      members: [{ user: { id: 'u9' } }, { user: { id: 'u10' } }]
+    });
+    assert(cache.getMember('g1', 'u9'));
+    assert(cache.getMember('g1', 'u10'));
+
+    cache.handle('THREAD_CREATE', { id: 't1', guild_id: 'g1', name: 'Thread' });
+    assert(cache.getChannel('t1'));
+    cache.handle('THREAD_DELETE', { id: 't1' });
+    assert.strictEqual(cache.getChannel('t1'), null);
+  });
+});
+
 // Run
 runner.run().then((results) => {
   process.exit(results.failed > 0 ? 1 : 0);

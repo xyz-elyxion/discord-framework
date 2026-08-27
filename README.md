@@ -20,9 +20,23 @@ JavaScript runtime with no Node.js, no npm, and no `node_modules`.
   Discord gateway protocol over the runtime's `tls`/`net` modules — Identify,
   heartbeat, **session resume (op 6/7/9)**, **presence updates**, **zlib-stream
   compression**, and **automatic reconnection** with backoff.
-- **Cache.** An in-memory store for guilds, channels, users, members, messages,
-  and roles, kept fresh automatically by gateway events.
-- **Safe by default.** No token logging, no magic globals.
+- **Full REST surface.** A typed `RestApi` layer over the whole Discord API:
+  reactions, bulk deletes, polls, pins, threads, permission overwrites, members
+  (search / chunked fetch-all), moderation (kick/ban/timeout/prune), roles,
+  invites, webhooks, emojis & stickers, scheduled events, audit logs, and
+  AutoMod rules.
+- **Derived events.** Easier-to-consume events alongside raw dispatches:
+  `message`, `messageUpdate`/`messageDelete` with old state, `reactionAdd`,
+  `guildMemberAdd` with `.guild` attached, `voiceStateUpdate` with join/leave/
+  move flags, `presenceUpdate`, `memberBoost`, and more.
+- **Voice signaling.** Join/move/leave voice channels (gateway op 4), complete
+  voice-gateway handshake — identify, heartbeats, UDP IP-discovery, protocol
+  select, session description — ready for you to plug an audio pipeline into.
+- **Cache & collections.** An in-memory store for guilds, channels, users,
+  members, messages, roles, and threads, kept fresh by gateway events, with a
+  discord.js-style `Collection` utility for filtering/sorting/random picks.
+- **Safe by default.** No token logging, no magic globals; optional
+  `defaultAllowedMentions` so your bot never pings @everyone by accident.
 
 ## Quick start
 
@@ -84,6 +98,7 @@ DISCORD_TOKEN=your-token-here elyxion bot.js
 | `intents` | `GUILDS, GUILD_MESSAGES, DIRECT_MESSAGES, MESSAGE_CONTENT` | Gateway intents (by name). |
 | `cache` | `true` | Enable the in-memory cache, or an options object (`{ messages: false, messageLimitPerChannel: 200, ... }`). |
 | `autoSync` | `true` | Auto-register slash commands with Discord after login. |
+| `defaultAllowedMentions` | `null` | Merged into every outgoing message unless it sets `allowed_mentions`. E.g. `{ parse: ['users'] }`. |
 
 `Bot` is an `EventEmitter`:
 
@@ -102,6 +117,14 @@ DISCORD_TOKEN=your-token-here elyxion bot.js
 - `bot.syncCommands()` — push registered slash commands to Discord.
 - `bot.sendMessage(channelId, content)` / `bot.editMessage` / `bot.deleteMessage` / `bot.sendFile`.
 - `bot.reply(message, content)` — reply with a mention + `message_reference`.
+- `bot.api` — the full [`RestApi`](#restapi--the-full-discord-api) object below.
+- `bot.voice` — the [voice manager](#voice-signaling): `join`, `leave`, `deafen`.
+- Convenience wrappers that throw tidy errors on HTTP failures: `bot.react`,
+  `bot.removeReaction`, `bot.clearReactions`, `bot.sendDM`, `bot.fetchMessages`,
+  `bot.memberRoles`, `bot.kick`, `bot.ban`, `bot.unban`, `bot.timeout`,
+  `bot.setNickname`, `bot.moveMember`, `bot.addRole`, `bot.removeRole`,
+  `bot.createChannel`, `bot.deleteChannel`, `bot.createInvite`, `bot.bulkDelete`,
+  `bot.triggerTyping`, `bot.fetchMembers(guildId)` (gateway op-8 member chunks).
 
 ### Command options
 
@@ -211,9 +234,10 @@ const { hasPermission, PERMISSIONS } = require('elyxion-discord');
 hasPermission('1071698660929', 'MANAGE_MESSAGES'); // true
 ```
 
-### Cache
+### Cache & collections
 
-`bot.cache` is kept fresh by gateway events automatically:
+`bot.cache` is kept fresh by gateway events automatically (including
+`GUILD_MEMBERS_CHUNK` and thread create/update/delete):
 
 ```js
 bot.cache.getGuild(id);                  // or getChannel / getUser / getRole
@@ -221,6 +245,105 @@ bot.cache.getMember(guildId, userId);
 bot.cache.getMessage(channelId, messageId);
 bot.on('messageCreate', (m) => { /* bot.cache already updated */ });
 ```
+
+The `Collection` utility (a Map subclass used throughout) adds helpers:
+
+```js
+const page = await bot.fetchMessages(channelId, { limit: 50 });
+page.filter((m) => m.author.bot).first;   // find/filter/map/sortInPlace/... 
+page.random(3);                           // N random entries
+```
+
+### Derived events
+
+Raw dispatches (`MESSAGE_CREATE`, ...) still fire exactly as before; these are
+**extras** emitted next to them:
+
+| Event | Payload highlights |
+| --- | --- |
+| `message` | Hydrated message: `.channel`, `.guild`, `.createdAt`, `.reference`. |
+| `messageUpdate` | `{ old, new }` — `old` when the cache saw the original. |
+| `messageDelete` | `{ old, id, channelId }`; also fires per-id from bulk deletes (`.bulk`). |
+| `reactionAdd` / `reactionRemove` | Emoji + resolved user. |
+| `reactionsClear` / `reactionsClearEmoji` | From the removal dispatches. |
+| `guildMemberAdd` | Cached member with `.guild` attached. |
+| `guildMemberRemove` | The leaving user. |
+| `memberUpdate` / `presenceUpdate` | `{ old, new }`. |
+| `voiceStateUpdate` | `{ old, new, joined, left, movedChannel }`. |
+| `typingStart` | Channel/user/timestamp. |
+| `memberBoost` / `memberUnboost` | Nitro boost lifecycle. |
+
+### `RestApi` — the full Discord API
+
+Every endpoint from reactions to AutoMod lives on `bot.api`:
+
+```js
+// Reactions
+await bot.react(channelId, messageId, '\u{1F44D}');       // unicode or custom form
+await bot.api.getReactions(channelId, messageId, emoji);
+await bot.clearReactions(channelId, messageId);
+await bot.bulkDelete(channelId, ids.slice(0, 100));       // 2-100 ids
+await bot.triggerTyping(channelId);
+await bot.api.sendPoll(channelId, 'Pizza?', ['Yes', 'No'], { durationHours: 24 });
+
+// Channels, threads & permissions
+await bot.createChannel(guildId, { name: 'general', type: 0 });
+await bot.api.putPermissionOverwrite(channelId, roleId, {
+  type: 0, allow: ['VIEW_CHANNEL'], deny: ['SEND_MESSAGES']   // names or bitfields
+});
+const thread = await bot.api.startThreadFromMessage(channelId, messageId, { name: 'Discussion' });
+
+// Moderation
+await bot.ban(guildId, userId, { deleteMessageSeconds: 3600 });
+await bot.timeout(guildId, userId, 10 * 60 * 1000);         // ms or ISO date
+await bot.setNickname(guildId, userId, 'NewNick');
+await bot.fetchMembers(guildId);                            // op-8 chunk sweep -> cache
+
+// Roles, invites, webhooks
+await bot.addRole(guildId, userId, roleId);
+const invite = await bot.createInvite(channelId, { maxAgeSeconds: 86400, maxUses: 25 });
+await bot.api.executeWebhook(webhookId, webhookToken, { content: 'via webhook' }, { wait: true });
+
+// Scheduled events, audit log, AutoMod
+await bot.api.createScheduledEvent(guildId, { name: 'Launch day', entityType: 3,
+  scheduledStartTime: iso, entityMetadataLocation: 'https://...' });
+await bot.api.getAuditLog(guildId, { actionType: 22, limit: 50 });
+await bot.api.createAutomodRule(guildId, {
+  name: 'no-invites', triggerType: 1,
+  triggerMetadata: { invite_code: true },
+  actions: [{ type: 1, metadata: { channel_id: logChannelId } }]
+});
+```
+
+All methods return `{ statusCode, data, body, headers }` and never throw for
+HTTP errors, except the `bot.*` convenience wrappers which resolve with `data`
+and throw a tidy error (with `.statusCode`) on failure.
+
+Permission plumbing is BigInt-free end to end: `permissionsToBitfield(['BAN_MEMBERS'])`
+returns the decimal bitfield string Discord expects (works with names, comma
+lists, numbers, or existing strings), and `hasPermission(bits, name)` reads it back.
+
+### Voice signaling
+
+Zero-dependency voice control up to the media handshake:
+
+```js
+bot.on('ready', async () => {
+  const conn = await bot.voice.join(guildId, channelId, { selfDeaf: true });
+  bot.on('connection', (conn2) => conn2.on('session', ({ mode, secretKey }) => {
+    // Handshake complete: select_protocol accepted, secret keys received.
+    // Feed your own Opus/RTP pipeline here if you need audio I/O.
+  }));
+});
+
+bot.voice.leave(guildId);            // disconnect + clear voice state
+bot.on('voiceStateUpdate', ({ joined, left, movedChannel }) => {});
+```
+
+Joining performs gateway op 4 → VOICE_STATE_UPDATE/VOICE_SERVER_UPDATE exchange
+→ voice WebSocket identify → heartbeats → UDP IP discovery (when the runtime
+exposes `dgram`) → select protocol. Audio encoding/encryption needs native code,
+so it's deliberately out of scope — but every signal along the way emits.
 
 ### `RestClient`
 

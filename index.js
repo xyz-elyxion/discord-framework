@@ -22,6 +22,10 @@ const { RestClient, DEFAULT_BASE_URL, routeKey, parseHeaders, sleepSync } = requ
 const { Gateway, FrameParser, encodeFrame } = require('./lib/gateway');
 const { Embed } = require('./lib/embed');
 const { Cache } = require('./lib/cache');
+const { Collection } = require('./lib/collection');
+const { RestApi, bulkDeleteBody, buildOverwrites, toBitfieldString } = require('./lib/api');
+const { EventEnricher } = require('./lib/events');
+const { VoiceManager, VoiceConnection, encodeDiscoveryPacket, parseDiscoveryPacket } = require('./lib/voice');
 const {
   InteractionRegistry,
   InteractionContext,
@@ -38,10 +42,11 @@ const {
 } = require('./lib/interactions');
 const {
   resolveColor, parseMention, snowflakeToDate, isSnowflake,
-  truncate, loadEnv, PERMISSIONS, hasPermission, hasBit, decimalToWords
+  truncate, loadEnv, buildQuery, encodeEmoji,
+  PERMISSIONS, hasPermission, hasBit, decimalToWords, permissionsToBitfield
 } = require('./lib/util');
 
-const VERSION = '0.2.0';
+const VERSION = '0.3.0';
 
 module.exports = {
   version: VERSION,
@@ -72,8 +77,24 @@ module.exports = {
   // Embeds
   Embed,
 
-  // Cache
+  // Cache & collections
   Cache,
+  Collection,
+
+  // Full REST API surface
+  RestApi,
+  bulkDeleteBody,
+  buildOverwrites,
+  toBitfieldString,
+
+  // Derived events
+  EventEnricher,
+
+  // Voice
+  VoiceManager,
+  VoiceConnection,
+  encodeDiscoveryPacket,
+  parseDiscoveryPacket,
 
   // Interactions
   InteractionRegistry,
@@ -94,10 +115,13 @@ module.exports = {
   hasPermission,
   hasBit,
   decimalToWords,
+  permissionsToBitfield,
   resolveColor,
   parseMention,
   snowflakeToDate,
   isSnowflake,
   truncate,
-  loadEnv
+  loadEnv,
+  buildQuery,
+  encodeEmoji
 };
